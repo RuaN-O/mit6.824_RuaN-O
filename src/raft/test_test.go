@@ -135,17 +135,22 @@ func TestBasicAgree2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
-
+	fmt.Println("step1")
 	cfg.begin("Test (2B): basic agreement")
 
 	iters := 3
+	fmt.Println("step2")
 	for index := 1; index < iters+1; index++ {
+
 		nd, _ := cfg.nCommitted(index)
+
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
 		}
-
+		fmt.Println("step3--start")
 		xindex := cfg.one(index*100, servers, false)
+		fmt.Println("step3--end")
+
 		if xindex != index {
 			t.Fatalf("got index %v but expected %v", xindex, index)
 		}
@@ -479,16 +484,20 @@ func TestRejoin2B(t *testing.T) {
 	cfg.rafts[leader1].Start(104)
 
 	// new leader commits, also for index=2
-	cfg.one(103, 2, true)
+	fmt.Println("103检查完毕之前")
 
+	cfg.one(103, 2, true)
+	fmt.Println("103检查完毕")
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
 	cfg.disconnect(leader2)
 
 	// old leader connected again
 	cfg.connect(leader1)
+	fmt.Println("104检查完毕之前")
 
 	cfg.one(104, 2, true)
+	fmt.Println("104检查完毕")
 
 	// all together now
 	cfg.connect(leader2)
