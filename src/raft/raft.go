@@ -104,6 +104,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 type RequestVoteArgs struct {
@@ -715,6 +718,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.PrevLogIndex >= len(self.logs) {
 		reply.Term = self.currentTerm
+		//快速找到conflictTerm和conflictIdx
+		reply.ConflictTerm = self.logs[len(self.logs)-1].Term
+		idx := self.logs[len(self.logs)-1].Index
+		for tidx := idx - 1; tidx >= 1; tidx-- {
+			if self.logs[tidx].Term == reply.ConflictTerm {
+				idx = tidx
+			} else {
+				break
+			}
+		}
+		reply.ConflictIndex = idx
 		reply.Success = false
 		return
 	}
@@ -722,6 +736,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if self.logs[args.PrevLogIndex].Term == args.PrevLogTerm {
 		uptodate = true
 	} else {
+		reply.ConflictTerm = self.logs[args.PrevLogIndex].Term
+		idx := self.logs[args.PrevLogIndex].Index
+		for tidx := idx - 1; tidx >= 1; tidx-- {
+			if self.logs[tidx].Term == reply.ConflictTerm {
+				idx = tidx
+			} else {
+				break
+			}
+		}
+		reply.ConflictIndex = idx
 		reply.Success = false
 	}
 
@@ -764,27 +788,29 @@ func (rf *Raft) handleAppendEntriesReply(t int, args *AppendEntriesArgs, reply *
 	if rf.state.isleader != LEADER {
 		return
 	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if reply.Success {
-		rf.mu.Lock()
+
 		rf.state.matchIndex[t] = args.PrevLogIndex + len(args.Entries)
 		rf.state.nextIndex[t] = args.PrevLogIndex + len(args.Entries) + 1
 		//fmt.Printf("node:%v's nextIndex:%v, matchIndex:%v\n", t, rf.state.nextIndex[t], rf.state.matchIndex[t])
-		rf.mu.Unlock()
+
 		//推进提交
 		if rf.state.matchIndex[t] > rf.state.commitIndex {
-			rf.pushCommit(rf.state.matchIndex[t])
+			go rf.pushCommit(rf.state.matchIndex[t])
 		}
 		return
 	} else {
-		rf.mu.Lock()
+
 		if reply.Term > rf.state.currentTerm { //降级为follower
 			rf.state.isleader = FOLLOWER
 			rf.state.voteFor = -1
 			rf.state.currentTerm = reply.Term
-			rf.mu.Unlock()
+
 			return
 		}
-		rf.mu.Unlock()
+
 		//找到符合要求的日志idx,递减到1
 		newargs := AppendEntriesArgs{
 			Term:         args.Term,
@@ -796,18 +822,12 @@ func (rf *Raft) handleAppendEntriesReply(t int, args *AppendEntriesArgs, reply *
 		}
 
 		newreply := AppendEntriesReply{}
-		newargs.PrevLogIndex--
-		rf.mu.Lock()
+		newargs.PrevLogIndex = reply.ConflictIndex - 1
+
 		newargs.PrevLogTerm = rf.state.logs[newargs.PrevLogIndex].Term
-		rf.mu.Unlock()
-		rf.appendEntriesToOne(t, &newargs, &newreply)
-		if newreply.Success {
-			rf.mu.Lock()
-			newargs.Entries = rf.state.logs[newargs.PrevLogIndex+1:]
-			rf.mu.Unlock()
-			newreply := AppendEntriesReply{}
-			rf.appendEntriesToOne(t, &newargs, &newreply)
-		}
+		newargs.Entries = rf.state.logs[newargs.PrevLogIndex+1:]
+
+		go rf.appendEntriesToOne(t, &newargs, &newreply)
 
 	}
 }
