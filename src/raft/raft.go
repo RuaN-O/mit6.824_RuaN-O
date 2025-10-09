@@ -20,7 +20,9 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,13 +71,13 @@ type Raft struct {
 }
 
 type state struct {
-	isleader           int
-	currentTerm        int
-	voteFor            int
-	logs               []etlog
-	heartchan          chan struct{}
-	appendentriesreply chan AppendEntriesReply
-	singleappendChan   chan struct{}
+	isleader         int
+	currentTerm      int
+	voteFor          int
+	logs             []etlog
+	heartchan        chan struct{}
+	singleappendChan chan struct{}
+	commitchan       chan struct{}
 
 	commitIndex int
 	lastApplied int
@@ -273,8 +275,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 
 // 发起一轮新的选举
-func (rf *Raft) election() int {
+var eletimes = 0
 
+func (rf *Raft) election() int {
+	eletimes++
+	fmt.Println("选举次数:", eletimes)
 	if rf.state.isleader == LEADER {
 		return LEADER
 	}
@@ -473,10 +478,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
 	if rf.state.isleader != LEADER {
 		return index, term, isLeader
 	}
+
 	lastLogIndex := rf.state.logs[len(rf.state.logs)-1].Index
 	newlog := etlog{
 		Term:    rf.state.currentTerm,
@@ -529,20 +534,13 @@ func (rf *Raft) ticker() {
 			//rf.drainHeartBearChan()
 			//time.Sleep(200 * time.Millisecond)
 			continue
+		// case <-rf.state.commitchan:
+		// 	rf.applyEntrieshelper()
+
 		case <-time.After(electionTimeout):
 			//触发选举流程
 			rf.election()
-		}
-	}
-}
 
-func (rf *Raft) drainHeartBearChan() {
-	for {
-		select {
-		case <-rf.state.heartchan:
-			continue
-		default:
-			return
 		}
 	}
 }
@@ -584,8 +582,8 @@ func (rf *Raft) singelAppendEntriesGo() { //广播某条日志
 		reply := AppendEntriesReply{}
 		go rf.appendEntriesToOne(t, &args, &reply)
 	}
-	rf.state.singleappendChan <- struct{}{}
 	rf.mu.Unlock()
+	rf.state.singleappendChan <- struct{}{}
 }
 
 func (rf *Raft) AppendEntriesGo() { //正常的日志复制心跳，定期执行
@@ -596,80 +594,10 @@ func (rf *Raft) AppendEntriesGo() { //正常的日志复制心跳，定期执行
 			continue
 		case <-time.After(timeout):
 			if rf.state.isleader != LEADER {
-				continue
+				return
 			}
-			targets := []int{}
-			for i := range rf.peers {
-				if i == rf.me {
-					continue
-				}
-				targets = append(targets, i)
-			}
-			//每一个target的信息不一样，需要分别发送
-			rf.mu.Lock()
-			self := rf.state
-			for _, t := range targets {
-				nextidx := self.nextIndex[t]
-				prevlogidx := nextidx - 1
-
-				prevlogTerm := self.logs[prevlogidx].Term
-				entries := make([]etlog, 0)
-				entries = append(entries, self.logs[prevlogidx+1:]...)
-
-				args := AppendEntriesArgs{
-					Term:         self.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: prevlogidx,
-					PrevLogTerm:  prevlogTerm,
-					Entries:      entries,
-					LeaderCommit: self.commitIndex,
-				}
-				reply := AppendEntriesReply{}
-				go rf.appendEntriesToOne(t, &args, &reply)
-			}
-			rf.mu.Unlock()
+			rf.singelAppendEntriesGo()
 		}
-	}
-}
-
-func (rf *Raft) sendHeartBeat() {
-	for {
-		if rf.state.isleader != LEADER {
-			return
-		}
-		targets := []int{}
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			targets = append(targets, i)
-		}
-		//每一个target的信息不一样，需要分别发送
-		rf.mu.Lock()
-		self := rf.state
-		for _, t := range targets {
-			nextidx := self.nextIndex[t]
-			prevlogidx := nextidx - 1
-
-			if prevlogidx < 0 || prevlogidx > len(rf.state.logs) {
-				continue
-			}
-
-			prevlogTerm := self.logs[prevlogidx].Term
-
-			args := AppendEntriesArgs{
-				Term:         self.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevlogidx,
-				PrevLogTerm:  prevlogTerm,
-				Entries:      nil,
-				LeaderCommit: self.commitIndex,
-			}
-			reply := AppendEntriesReply{}
-			go rf.appendEntriesToOne(t, &args, &reply)
-		}
-		rf.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -690,7 +618,6 @@ func max(a, b int) int {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	self := rf.state
 
@@ -698,6 +625,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = self.currentTerm
 	reply.Success = false
 	if args.Term < self.currentTerm {
+		rf.mu.Unlock()
 		return
 	}
 
@@ -730,6 +658,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.ConflictIndex = idx
 		reply.Success = false
+		rf.mu.Unlock()
 		return
 	}
 
@@ -756,6 +685,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if len(args.Entries) == 0 {
 			self.commitIndex = max(args.LeaderCommit, rf.state.commitIndex)
 			reply.Success = true
+			rf.mu.Unlock()
+			//rf.state.commitchan <- struct{}{}
+			rf.applyEntrieshelper()
 			return
 		}
 		//fmt.Printf("node:%v,收到报文:%v并处理\n", rf.me, args.Entries)
@@ -774,6 +706,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		self.nextIndex[rf.me] = self.matchIndex[rf.me] + 1
 
 		self.commitIndex = max(args.LeaderCommit, rf.state.commitIndex)
+		rf.mu.Unlock()
+		rf.applyEntrieshelper()
+		//rf.state.commitchan <- struct{}{}
 
 		//fmt.Printf("node:%v 已成功处理appendets success\n", rf.me)
 		//fmt.Printf("node:%v 操作日志:%v\n", rf.me, opmap[rf.me])
@@ -798,7 +733,7 @@ func (rf *Raft) handleAppendEntriesReply(t int, args *AppendEntriesArgs, reply *
 
 		//推进提交
 		if rf.state.matchIndex[t] > rf.state.commitIndex {
-			go rf.pushCommit(rf.state.matchIndex[t])
+			go rf.pushCommit()
 		}
 		return
 	} else {
@@ -822,7 +757,7 @@ func (rf *Raft) handleAppendEntriesReply(t int, args *AppendEntriesArgs, reply *
 		}
 
 		newreply := AppendEntriesReply{}
-		newargs.PrevLogIndex = reply.ConflictIndex - 1
+		newargs.PrevLogIndex = max(reply.ConflictIndex-1, 0)
 
 		newargs.PrevLogTerm = rf.state.logs[newargs.PrevLogIndex].Term
 		newargs.Entries = rf.state.logs[newargs.PrevLogIndex+1:]
@@ -832,64 +767,39 @@ func (rf *Raft) handleAppendEntriesReply(t int, args *AppendEntriesArgs, reply *
 	}
 }
 
-func (rf *Raft) pushCommit(idx int) {
+func (rf *Raft) pushCommit() {
 	//fmt.Println("推进提交idx:", idx)
-	count := 0
-	for _, v := range rf.state.matchIndex {
-		if v >= idx {
-			count++
-		}
-	}
-	if count > len(rf.peers)/2 {
+
+	matches := make([]int, len(rf.peers))
+	rf.mu.Lock()
+	copy(matches, rf.state.matchIndex)
+	rf.mu.Unlock()
+	sort.Ints(matches)
+	N := matches[len(matches)/2]
+	if N > rf.state.commitIndex {
 		rf.mu.Lock()
-		rf.state.commitIndex = max(rf.state.commitIndex, idx)
+		rf.state.commitIndex = N
 		rf.mu.Unlock()
 		//fmt.Println("推进提交成功，commitidx:", rf.state.commitIndex)
-
-	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func (rf *Raft) solveHeartBeatChan() {
-	counter := 0
-	for {
-		if rf.state.isleader != LEADER {
-			return
-		}
-		select {
-		case reply := <-rf.state.appendentriesreply:
-			if reply.Success {
-				continue
-			} else {
-				rf.mu.Lock()
-				if reply.Term > rf.state.currentTerm { //降级为follower
-					rf.state.isleader = FOLLOWER
-					rf.state.voteFor = -1
-					rf.state.currentTerm = reply.Term
-				}
-				rf.mu.Unlock()
-				counter++
-				if counter == 10 {
-					counter = 0
-					//time.Sleep(5 * time.Millisecond)
-				}
-			}
-		default:
-			//time.Sleep(5 * time.Millisecond)
-		}
+		//rf.state.commitchan <- struct{}{}
+		rf.applyEntrieshelper()
 	}
 }
 
 func (rf *Raft) applyEntries() { //更新自己的lastapply和commitidx
 	for {
-		if rf.state.lastApplied < rf.state.commitIndex {
-			rf.mu.Lock()
+		select {
+		case <-rf.state.commitchan:
+			rf.applyEntrieshelper()
+		default:
+		}
+	}
+}
+
+func (rf *Raft) applyEntrieshelper() {
+	if rf.state.lastApplied < rf.state.commitIndex {
+		rf.mu.Lock()
+		for rf.state.lastApplied < rf.state.commitIndex {
 			var ok bool
 			if rf.state.lastApplied+1 < len(rf.state.logs) {
 				ok = rf.doEntry(&rf.state.logs[rf.state.lastApplied+1])
@@ -904,8 +814,8 @@ func (rf *Raft) applyEntries() { //更新自己的lastapply和commitidx
 				rf.applyCh <- applymsg
 				//fmt.Println(rf.me, "应用到状态机成功,lastapplied:", rf.state.lastApplied)
 			}
-			rf.mu.Unlock()
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -944,14 +854,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		currentTerm: 0,
 		voteFor:     -1,
 
-		commitIndex:        0,
-		lastApplied:        0,
-		logs:               make([]etlog, 0),
-		heartchan:          make(chan struct{}, 10),
-		appendentriesreply: make(chan AppendEntriesReply, 100),
-		singleappendChan:   make(chan struct{}, 10),
-		nextIndex:          make([]int, len(rf.peers)),
-		matchIndex:         make([]int, len(rf.peers)),
+		commitIndex:      0,
+		lastApplied:      0,
+		logs:             make([]etlog, 0),
+		heartchan:        make(chan struct{}, 50),
+		singleappendChan: make(chan struct{}, 50),
+		commitchan:       make(chan struct{}, 100),
+		nextIndex:        make([]int, len(rf.peers)),
+		matchIndex:       make([]int, len(rf.peers)),
 	}
 	state.logs = append(state.logs, etlog{
 		Term:    0,
@@ -968,6 +878,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.applyEntries()
 	return rf
 }
