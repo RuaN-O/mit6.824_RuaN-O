@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 
 	"bytes"
+	"context"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -129,82 +130,14 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-type PingArgs struct {
-	Id int
-}
-type PingReply struct {
-	Success bool
-}
-
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
-func (rf *Raft) sendPing(server int, args *PingArgs, reply *PingReply) bool {
-	ok := rf.peers[server].Call("Raft.Ping", args, reply)
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
-}
-
-// 选举前的探测
-
-func (rf *Raft) PingGo() bool {
-	targets := []int{}
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		targets = append(targets, i)
-	}
-	pingbuckect := make(chan struct{}, len(rf.peers))
-
-	var wg sync.WaitGroup
-
-	for _, t := range targets {
-		wg.Add(1)
-		go func(t int) {
-			defer wg.Done()
-			args := PingArgs{Id: rf.me}
-			reply := PingReply{}
-			ok := rf.sendPing(t, &args, &reply)
-			if ok {
-				if reply.Success {
-					pingbuckect <- struct{}{}
-				}
-			}
-		}(t)
-	}
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	count := 0
-	for {
-		select {
-		case <-pingbuckect:
-			count++
-		default:
-			return count >= len(rf.peers)/2
-		}
-	}
-}
-
-func (rf *Raft) Ping(args *PingArgs, reply *PingReply) {
-	if args.Id != -1 {
-		reply.Success = true
-	}
 }
 
 // return currentTerm and whether this server
@@ -390,6 +323,8 @@ func (rf *Raft) election() int {
 }
 
 func (rf *Raft) electionhelper(votecounter *int32, args *RequestVoteArgs) int {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	targets := []int{}
 	for i := range rf.peers {
 		if i == rf.me {
@@ -402,8 +337,9 @@ func (rf *Raft) electionhelper(votecounter *int32, args *RequestVoteArgs) int {
 
 	for _, t := range targets {
 		wg.Add(1)
-		go func(t int) {
+		go func(ctx context.Context, t int) {
 			defer wg.Done()
+			ch := make(chan struct{}, 1)
 			reply := RequestVoteReply{}
 			ok := rf.sendRequestVote(t, args, &reply)
 			if ok {
@@ -419,8 +355,15 @@ func (rf *Raft) electionhelper(votecounter *int32, args *RequestVoteArgs) int {
 				if reply.VoteGranted {
 					atomic.AddInt32(votecounter, 1)
 				}
+				ch <- struct{}{}
 			}
-		}(t)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ch:
+				return
+			}
+		}(ctx, t)
 	}
 	done := make(chan struct{})
 	go func() {
@@ -651,15 +594,15 @@ func (rf *Raft) AppendEntriesGo() { //正常的日志复制心跳，定期执行
 		case <-rf.State.singleappendChan:
 			continue
 		case <-time.After(timeout):
-			if rf.State.isleader != LEADER {
-				return
-			}
 			rf.singelAppendEntriesGo()
 		}
 	}
 }
 
 func (rf *Raft) appendEntriesToOne(t int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if rf.State.isleader != LEADER {
+		return
+	}
 	ok := rf.sendAppendEntries(t, args, reply)
 	//self.appendentriesreply <- reply
 	if ok {
@@ -735,7 +678,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.ConflictIndex = idx
 		//删除冲突点之后的日志
-		self.Logs = self.Logs[:idx+1]
+		self.Logs = self.Logs[:idx]
 		rf.persist()
 		reply.Success = false
 	}
@@ -891,7 +834,7 @@ func (rf *Raft) doEntry(log *etlog) bool {
 
 func (rf *Raft) leaderstuff() { //领导负责的事务，心跳，处理心跳回复，以及todo appendentries
 	//go rf.sendHeartBeat()
-	go rf.AppendEntriesGo()
+	rf.AppendEntriesGo()
 
 	//go rf.solveHeartBeatChan() //包含了处理heartbeat和appendentriesreply
 
